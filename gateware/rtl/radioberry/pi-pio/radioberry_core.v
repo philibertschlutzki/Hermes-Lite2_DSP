@@ -66,7 +66,10 @@ parameter       DSIQ_FIFO_DEPTH = 16384;
 
 parameter 		FPGA_TYPE = 2'b10; //CL016 = 2'b01 ; CL025 = 2'b10
 localparam      VERSION_MAJOR = 8'd75;
-localparam      VERSION_MINOR = 8'd0;
+localparam      VERSION_MINOR = 8'd1;
+
+localparam int NR_CLAMP = (NR > 6) ? 6 : NR;
+localparam int NT_CLAMP = (NT > 1) ? 1 : NT;
 
 
 logic   [5:0]   cmd_addr;
@@ -137,12 +140,16 @@ reset_handler reset_handler_inst(.clock(clk_internal), .reset(reset));
 wire [47:0] spi0_recv;
 
 logic [1:0] fpgatype;
+logic [3:0] no_rx;
+logic [1:0] no_tx;
 generate
 	if (FPGA_TYPE == 2'b01) assign fpgatype = 2'b01; else assign fpgatype = 2'b10;
+	assign no_rx = NR_CLAMP[3:0];
+    assign no_tx = NT_CLAMP[1:0];
 endgenerate
 
 logic [47:0] ret_info;
-assign ret_info = {resp, 8'b0 , 8'b0, 6'b0, fpgatype, VERSION_MAJOR, VERSION_MINOR};
+assign ret_info = {resp, 8'b0 , 8'b0, no_tx, no_rx, fpgatype, VERSION_MAJOR, VERSION_MINOR};
 
 spi_slave #(.WIDTH(48)) spi_slave_inst(.rstb(!reset),.ten(1'b1),.tdata(ret_info),.mlb(1'b1),.ss(pi_spi_ce[0]),.sck(pi_spi_sck),.sdin(pi_spi_mosi), .sdout(pi_spi_miso),.done(pi_spi_done),.rdata(spi0_recv));
 
@@ -209,7 +216,12 @@ logic wr_tready = 0;
 logic wr_tready_d = 0;
 logic [7:0] tx_part_iq;
   
-always @(posedge pi_tx_clk) wr_tready_d <= (wr_tready & ~reset); 
+
+always @(posedge pi_tx_clk)
+begin
+  if (reset) wr_tready_d <= 1'b0;
+  else       wr_tready_d <= wr_tready;
+end
 
 assign pi_tx_ready = wr_tready_d;
  
