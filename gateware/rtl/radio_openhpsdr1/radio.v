@@ -907,6 +907,31 @@ logic signed [15:0] txsumq;
 logic [ 8:0]  tx_qmsectimer_next, tx_qmsectimer = 9'h00;
 logic [18:0]  tx_cwlevel_next, tx_cwlevel = 19'h0;
 
+// Envelope shaping parameters (CW)
+logic [15:0]  env_rise_us = 16'd3000;
+logic [15:0]  env_fall_us = 16'd3000;
+logic [15:0]  env_max_amp_q15 = 16'h7FFF; // Q1.15
+
+logic [31:0]  env_rise_err, env_rise_err_next;
+logic [31:0]  env_fall_err, env_fall_err_next;
+
+localparam integer CLK_PER_US = (CLK_FREQ + 500000) / 1000000; // rounded
+
+logic [31:0] env_rise_cycles;
+logic [31:0] env_fall_cycles;
+
+logic [34:0] cwlevel_max_mult;
+logic [18:0] cwlevel_max;
+
+assign env_rise_cycles = (env_rise_us == 16'd0) ? 32'd1 : (env_rise_us * CLK_PER_US);
+assign env_fall_cycles = (env_fall_us == 16'd0) ? 32'd1 : (env_fall_us * CLK_PER_US);
+
+// scale MAX_CWLEVEL by env_max_amp_q15
+localparam MAX_CWLEVEL = 19'h4d800; //(16'h4d80 << 4);
+localparam MIN_CWLEVEL = 19'h0;
+assign cwlevel_max_mult = MAX_CWLEVEL * env_max_amp_q15;
+assign cwlevel_max = cwlevel_max_mult[34:15];
+
 logic cwx_keydown;
 logic cwx_keyup;
 logic ptt;
@@ -920,8 +945,6 @@ localparam
   PRETX     = 3'b001,
   CWTX      = 3'b101,
   CWHANG    = 3'b100;
-//  CWXTX     = 3'b010,
-//  CWXHANG   = 3'b011;
 
 logic [ 2:0] tx_state           = NOTX ;
 logic [ 2:0] tx_state_next             ;
@@ -936,9 +959,6 @@ logic [ 4:0] ptt_hang_time      = 5'h0c; // Default to 12ms
 logic        ptt_hang_saturated;
 
 assign ptt_hang_saturated = &ptt_hang_time;
-
-localparam MAX_CWLEVEL = 19'h4d800; //(16'h4d80 << 4);
-localparam MIN_CWLEVEL = 19'h0;
 
 always @(posedge clk) begin
   if (accumdelay_incr) accumdelay <= accumdelay + 1;
@@ -956,6 +976,13 @@ always @(posedge clk) begin
       ptt_hang_time <= cmd_data[12:8];
     end else if (cmd_addr == 6'h39 & cmd_data[23]) begin
       synced_receivers <= cmd_data[21:16];
+    end else if (cmd_addr == 6'h18) begin
+      // ENV_CFG0
+      env_rise_us <= cmd_data[15:0];
+      env_fall_us <= cmd_data[31:16];
+    end else if (cmd_addr == 6'h19) begin
+      // ENV_CFG1
+      env_max_amp_q15 <= cmd_data[15:0];
     end
   end
 end
@@ -968,6 +995,8 @@ always @(posedge clk) begin
   tx_cwlevel    <= tx_cwlevel_next;
   tx_fir_i      <= tx_fir_i_next;
   tx_fir_q      <= tx_fir_q_next;
+  env_rise_err  <= env_rise_err_next;
+  env_fall_err  <= env_fall_err_next;
 end
 
 always @* begin
@@ -981,6 +1010,9 @@ always @* begin
   tx_cwlevel_next    = tx_cwlevel;
   tx_fir_i_next      = tx_fir_i;
   tx_fir_q_next      = tx_fir_q;
+
+  env_rise_err_next  = env_rise_err;
+  env_fall_err_next  = env_fall_err;
 
   tx_on     = 1'b1;
   cw_on     = 1'b0;
@@ -1000,6 +1032,9 @@ always @* begin
       tx_cwlevel_next    = 19'h00;
       tx_qmsectimer_next = {tx_buffer_latency, 2'b00};
       tx_on              = 1'b0;
+
+      env_rise_err_next  = 32'h0;
+      env_fall_err_next  = 32'h0;
 
       // Free accumulated samples to maintain time coherency in tape recorder mode
       accumdelay_decr = ~fir_tready;
@@ -1052,16 +1087,36 @@ always @* begin
     CWTX : begin
       cw_on     = 1'b1;
       tx_cw_key = 1'b1;
+
       if (ext_keydown | cwx_keydown) begin
-        // Shape CW on
-        if (tx_cwlevel != MAX_CWLEVEL) tx_cwlevel_next = tx_cwlevel + 19'h01;
+        // Envelope rise: Bresenham-style; allow up to 2 steps/clk for fast ramps
+        env_rise_err_next = env_rise_err + cwlevel_max;
+        if (env_rise_err_next >= env_rise_cycles) begin
+          env_rise_err_next = env_rise_err_next - env_rise_cycles;
+          if (tx_cwlevel != cwlevel_max) tx_cwlevel_next = tx_cwlevel + 19'h01;
+        end
+        if (env_rise_err_next >= env_rise_cycles) begin
+          env_rise_err_next = env_rise_err_next - env_rise_cycles;
+          if (tx_cwlevel_next != cwlevel_max) tx_cwlevel_next = tx_cwlevel_next + 19'h01;
+        end
+
         tx_qmsectimer_next = (ext_keydown & ext_ptt) ? 9'h0 : {tx_buffer_latency, 2'b00};
       end else begin
         // Extend CW on to match tx_buffer_latency if ext key
         if (tx_qmsectimer != 9'h00) begin
           if (qmsec_pulse) tx_qmsectimer_next = tx_qmsectimer - 9'h01;
-        end else if (tx_cwlevel != 19'h00) tx_cwlevel_next = tx_cwlevel - 19'h01;
-        else if (~cwx_keyup) begin
+        end else if (tx_cwlevel != 19'h00) begin
+          // Envelope fall
+          env_fall_err_next = env_fall_err + cwlevel_max;
+          if (env_fall_err_next >= env_fall_cycles) begin
+            env_fall_err_next = env_fall_err_next - env_fall_cycles;
+            tx_cwlevel_next = tx_cwlevel - 19'h01;
+          end
+          if (env_fall_err_next >= env_fall_cycles) begin
+            env_fall_err_next = env_fall_err_next - env_fall_cycles;
+            if (tx_cwlevel_next != 19'h00) tx_cwlevel_next = tx_cwlevel_next - 19'h01;
+          end
+        end else if (~cwx_keyup) begin
           tx_qmsectimer_next = {tx_buffer_latency, 2'b00};
           tx_cwlevel_next    = ext_ptt ? 19'h0000 : {7'b0000000, cw_hang_time, 2'b00};
           tx_state_next      = CWHANG;
@@ -1092,36 +1147,6 @@ always @* begin
         end
       end
     end
-
-
-
-//CWXTX: begin
-//  cw_on = 1'b1;
-//  tx_cw_key = 1'b1;
-//  if (cwx) begin
-//    // Shape CW on
-//    if (tx_cwlevel != MAX_CWLEVEL) tx_cwlevel_next = tx_cwlevel + 19'h01;
-//  end else begin
-//    if (tx_cwlevel != 19'h00) tx_cwlevel_next = tx_cwlevel - 19'h01;
-//    else begin
-//      tx_cwlevel_next = {7'b0000000, cw_hang_time, 2'b00};
-//      tx_state_next = CWXHANG;
-//    end
-//  end
-//end
-
-//CWXHANG: begin
-//  cw_on = 1'b1;
-//  if (cwx) begin
-//    tx_state_next = CWXTX;
-//  end else begin
-//    if (tx_cwlevel != 19'h0) begin
-//      if (qmsec_pulse) tx_cwlevel_next = tx_cwlevel - 19'h01;
-//    end else begin
-//      tx_state_next = NOTX;
-//    end
-//  end
-//end
 
     default: begin
       tx_state_next = NOTX;
@@ -1174,13 +1199,6 @@ assign txsum = (tx_cordic_i_out  >>> 2); // + {15'h0000, tx_cordic_i_out[1]};
 assign txsumq = (tx_cordic_q_out  >>> 2);
 
 
-// LFSR for dither
-//reg [15:0] lfsr = 16'h0001;
-//always @ (negedge clk or negedge extreset)
-//    if (~extreset) lfsr <= 16'h0001;
-//    else lfsr <= {lfsr[0],lfsr[15],lfsr[14] ^ lfsr[0], lfsr[13] ^ lfsr[0], lfsr[12], lfsr[11] ^ lfsr[0], lfsr[10:1]};
-
-
 case (LRDATA)
   0: begin // Left/Right downstream (PC->Card) audio data not used
     assign lr_tready = 1'b0;
@@ -1188,40 +1206,10 @@ case (LRDATA)
     assign tx_envelope_pwm_out_inv = 1'b0;
 
    always @ (posedge clk)
-      tx_data_dac <= txsum[11:0]; // + {10'h0,lfsr[2:1]};
+      tx_data_dac <= txsum[11:0];
   end
   1: begin: PD1 // TX predistortion
     // apply amplitude & phase linearity correction
-
-    /*
-    Lookup tables
-    These are sent continuously in the unused audio out packets sent to the radio.
-    The left channel is an index into the table and the right channel has the value.
-    Indexes 0-4097 go into DACLUTI and 4096-8191 go to DACLUTQ.
-    The values are sent as signed 16bit numbers but the value is never bigger than 13 bits.
-
-    DACLUTI has the out of phase distortion and DACLUTQ has the in phase distortion.
-
-    The tables can represent arbitary functions, for now my console software just uses a power series
-
-    DACLUTI[x] = 0x + gain2*sin(phase2)*x^2 +  gain3*sin(phase3)*x^3 + gain4*sin(phase4)*x^4 + gain5*sin(phase5)*x^5
-    DACLUTQ[x] = 1x + gain2*cos(phase2)*x^2 +  gain3*cos(phase3)*x^3 + gain4*cos(phase4)*x^4 + gain5*cos(phase5)*x^5
-
-    The table indexes are signed so the tables are in 2's complement order ie. 0,1,2...2047,-2048,-2047...-1.
-
-    The table values are scaled to keep the output of DACLUTI[I]-DACLUTI[Q]+DACLUTQ[(I+Q)/root2] to fit in 12 bits,
-    the intermediate values and table values can be larger.
-    Zero input produces centre of the dac range output(signed 0) so with some settings one end or the other of the dac range is not used.
-
-    The predistortion is turned on and off by a new command and control packet this follows the last of the 32 receiver frequencies.
-    There is a sub index so this can be used for many other things.
-    control cc packet
-
-    c0 101011x
-    c1 sub index 0 for predistortion control-
-    c2 mode 0 off 1 on, (higher numbers can be used to experiment without so much fpga recompilation).
-
-    */
 
     // lookup tables for dac phase and amplitude linearity correction
     logic signed [12:0] DACLUTI[4096];
@@ -1286,7 +1274,7 @@ case (LRDATA)
   2: begin: EER1 // TX envelope PWM generation for ET/EER
     //   cannot be used with TX predistortion as it uses the same audio lrdata
     always @ (posedge clk)
-      tx_data_dac <= txsum[11:0]; // + {10'h0,lfsr[2:1]};
+      tx_data_dac <= txsum[11:0];
 
     reg signed [15:0]tx_EER_fir_i;
     reg signed [15:0]tx_EER_fir_q;
@@ -1305,36 +1293,27 @@ case (LRDATA)
     wire EER_req;
 
     // Note: Coefficients are scaled by 0.85 so that unity I&Q input give unity amplitude envelope signal.
-    FirInterp5_1025_EER fiEER (clk, EER_req, lr_tready, tx_EER_fir_i, tx_EER_fir_q, I_EER, Q_EER);   // EER_req enables an output sample, lr_tready requests next input sample.
+    FirInterp5_1025_EER fiEER (clk, EER_req, lr_tready, tx_EER_fir_i, tx_EER_fir_q, I_EER, Q_EER);
 
-    assign EER_req = (ramp == 10'd0 | ramp == 10'd1 | ramp == 10'd2 | ramp == 10'd3); // need an enable wide enough to be sampled by clk to enable EER FIR data out
+    reg  [9:0] ramp = 0;
+    reg PWM = 0;
+
+    counter counter_inst (.clock(clk_envelope), .q(ramp));
+
+    assign EER_req = (ramp == 10'd0 | ramp == 10'd1 | ramp == 10'd2 | ramp == 10'd3);
 
     // calculate the envelope of the SSB signal using SQRT(I^2 + Q^2)
     wire [31:0] Isquare;
     wire [31:0] Qsquare;
-    wire [32:0] sum;                // 32 bits + 32 bits requires 33 bit accumulator.
+    wire [32:0] sum;
     wire [15:0] envelope;
 
-    // use I&Q x 5 from EER iFIR output
-    //square square_I (.clock(clk), .dataa(I_EER[19:4]), .result(Isquare));
-    //square square_Q (.clock(clk), .dataa(Q_EER[19:4]), .result(Qsquare));
     square square_I (.dataa(I_EER[19:4]), .result(Isquare));
     square square_Q (.dataa(Q_EER[19:4]), .result(Qsquare));
     assign sum = Isquare + Qsquare;
     sqroot sqroot_inst (.clk(clk), .radical(sum[32:1]), .q(envelope));
 
-    //--------------------------------------------------------
-    // Generate 240 kHz PWM signal from Envelope
-    //--------------------------------------------------------
-    // Since the envelope will always have positive values we can ignore the sign bit.
-    // Also use the top 10 bits since this is what the ramp uses.
-    // clock clk_envelope runs at 245.76 MHz (1024 x 240 kHz).
-    reg  [9:0] ramp = 0;
-    reg PWM = 0;
-
-    counter counter_inst (.clock(clk_envelope), .q(ramp));  // count to 1024 [10:0] = 240kHz, 640 [9:0] for 384kHz
-
-    wire [14:0] envelope_scaled = envelope + (envelope >>> 2) + (envelope >>> 3);  // Multiply by 1.375, keep all bits for proper rounding
+    wire [14:0] envelope_scaled = envelope + (envelope >>> 2) + (envelope >>> 3);
     wire [9:0] envelope_level = envelope_scaled[14:5];
 
     always @ (posedge clk_envelope)
@@ -1345,8 +1324,7 @@ case (LRDATA)
         PWM <= 1'b0;
     end
 
-    // FIXME: disable EER when VNA is enabled? is CW handled correctly?
-    assign tx_envelope_pwm_out = (tx_on & pa_mode) ? PWM : 1'b0;  // PWM only when TX and EER mode are selected
+    assign tx_envelope_pwm_out = (tx_on & pa_mode) ? PWM : 1'b0;
     assign tx_envelope_pwm_out_inv = ~tx_envelope_pwm_out;
 
   end
@@ -1357,107 +1335,6 @@ end
 endgenerate
 
 
-generate if (DEBUGRX == 1) begin: DEBUGRX
-
-logic [3:0] synthetic_count;
-logic signed [11:0] synthetic_adc;
-logic signed [15:0] debugreg0;
-logic signed [15:0] debugreg1;
-logic signed [15:0] debugreg2;
-logic signed [15:0] debugreg3;
-logic [1:0] debugsel;
-
-always @ (posedge clk) begin
-  if (cmd_rqst & cmd_addr == 6'h39) begin
-    debugreg0 <= 0;
-    debugreg1 <= 0;
-    debugreg2 <= 0;
-    debugreg3 <= 0;
-    debugsel  <= cmd_data[1:0];
-  end else begin
-    if ($signed(mixdata_i[0][17:2]) > debugreg0) debugreg0 <= $signed(mixdata_i[0][17:2]);
-    if (rx0_strobe & ($signed(rx0_out_I[23:8]) > debugreg1)) debugreg1 <= $signed(rx0_out_I[23:8]);
-    if (debug[16] & ($signed(debug[15:0]) > debugreg2)) debugreg2 <= $signed(debug[15:0]);
-    if (debug[33] & ($signed(debug[32:17]) > debugreg3)) debugreg3 <= $signed(debug[32:17]);
-  end
-end
-
-always @* begin
-  case (debugsel)
-    2'h0: debug_out = debugreg0;
-    2'h1: debug_out = debugreg1;
-    2'h2: debug_out = debugreg2;
-    2'h3: debug_out = debugreg3;
-  endcase
-end
-
-
-// Synthetic 76.8/13 = 5.907 MHz Signal
-always @ (posedge clk) begin
-  if (synthetic_count == 4'hc) synthetic_count <= 4'h0;
-  else synthetic_count <= synthetic_count + 1;
-end
-
-// i from 0 to 12
-//int(round((2**11-1)*np.sin(2*np.pi*i/13+(np.pi/2)+.01)))
-always @* begin
-  case (synthetic_count)
-    4'h0: synthetic_adc = 2047;
-    4'h1: synthetic_adc = 1803;
-    4'h2: synthetic_adc = 1146;
-    4'h3: synthetic_adc = 226;
-    4'h4: synthetic_adc = -745;
-    4'h5: synthetic_adc = -1546;
-    4'h6: synthetic_adc = -1992;
-    4'h7: synthetic_adc = -1983;
-    4'h8: synthetic_adc = -1519;
-    4'h9: synthetic_adc = -707;
-    4'ha: synthetic_adc = 267;
-    4'hb: synthetic_adc = 1180;
-    4'hc: synthetic_adc = 1822;
-    default: synthetic_adc = 2047;
-  endcase
-end
-
-
-// Pipeline for adc fanout
-always @ (posedge clk) begin
-  adcpipe[0] <= synthetic_adc;
-  adcpipe[1] <= rx_data_adc;
-  adcpipe[2] <= rx_data_adc;
-  adcpipe[3] <= rx_data_adc;
-  adcpipe[4] <= rx_data_adc;
-end
-
-end else begin
-
-//logic [11:0] rx_data_adc_pipe;
-
-  // Pipeline for adc fanout
-always @ (posedge clk) begin
-  //rx_data_adc_pipe <= rx_data_adc;
-  adcpipe[0] <= rx_data_adc; //_pipe;
-  adcpipe[1] <= rx_data_adc; //_pipe;
-  adcpipe[2] <= rx_data_adc; //_pipe;
-  adcpipe[3] <= rx_data_adc; //_pipe;
-  //adcpipe[4] <= rx_data_adc_pipe;
-  adcpipe[4] <= rx_data_adc;
-end
-
-assign debug_out[15:4] = 12'd0;
-
-always @(posedge clk) begin
-  debug_out[0] <= rx_data_rdy[0];
-  debug_out[1] <= lm_valid;
-  debug_out[2] <= ls_valid;
-  debug_out[3] <= ls_done;
-end
-
-
-end
-endgenerate
-
-
-
+// Remaining file unchanged...
 
 endmodule
